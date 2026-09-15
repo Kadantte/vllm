@@ -1,19 +1,20 @@
-import torch
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from .interface import Platform, PlatformEnum
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
-class TpuPlatform(Platform):
-    _enum = PlatformEnum.TPU
+try:
+    from tpu_inference.platforms import (
+        TpuPlatform as TpuInferencePlatform,
+    )
 
-    @classmethod
-    def get_device_name(cls, device_id: int = 0) -> str:
-        raise NotImplementedError
-
-    @classmethod
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
-        raise NotImplementedError
-
-    @classmethod
-    def inference_mode(cls):
-        return torch.no_grad()
+    TpuPlatform = TpuInferencePlatform  # type: ignore
+    USE_TPU_INFERENCE = True
+except ImportError:
+    logger.error(
+        "tpu_inference not found, please install tpu_inference to run vllm on TPU"
+    )
+    pass

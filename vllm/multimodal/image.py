@@ -1,76 +1,60 @@
-from functools import lru_cache
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import torch
-from PIL import Image
-from transformers.image_processing_base import BatchFeature
+import contextlib
 
-from vllm.config import ModelConfig
-from vllm.inputs.registry import InputContext
-from vllm.logger import init_logger
-from vllm.transformers_utils.processor import get_image_processor
-from vllm.utils import is_list_of
-
-from .base import MultiModalData, MultiModalInputs, MultiModalPlugin
-
-logger = init_logger(__name__)
-
-cached_get_image_processor = lru_cache(get_image_processor)
+from PIL import Image, ImageOps
 
 
-class ImagePlugin(MultiModalPlugin):
-    """Plugin for image data."""
+def rescale_image_size(
+    image: Image.Image, size_factor: float, transpose: int = -1
+) -> Image.Image:
+    """Rescale the dimensions of an image by a constant factor."""
+    new_width = int(image.width * size_factor)
+    new_height = int(image.height * size_factor)
+    image = image.resize((new_width, new_height))
+    if transpose >= 0:
+        image = image.transpose(Image.Transpose(transpose))
+    return image
 
-    def get_data_key(self) -> str:
-        return "image"
 
-    def _get_hf_image_processor(self, model_config: ModelConfig):
-        mm_processor_kwargs = ({} if model_config.mm_processor_kwargs is None
-                               else model_config.mm_processor_kwargs)
-        # We don't explicitly check kwarg overrides to the HF class
-        # since the automodel just takes kwargs, so we can't inspect it
-        return cached_get_image_processor(
-            model_config.model,
-            trust_remote_code=model_config.trust_remote_code,
-            **mm_processor_kwargs)
+def normalize_image(image: Image.Image) -> Image.Image:
+    """Normalize EXIF orientation so the pixel data matches visual display."""
+    with contextlib.suppress(Exception):
+        image = ImageOps.exif_transpose(image)
+    return image
 
-    def _default_input_mapper(
-        self,
-        ctx: InputContext,
-        data: MultiModalData[object],
-    ) -> MultiModalInputs:
-        model_config = ctx.model_config
 
-        # Processed by input processor
-        if isinstance(data, BatchFeature):
-            return MultiModalInputs(data.data)
+def rgba_to_rgb(
+    image: Image.Image,
+    background_color: tuple[int, int, int] | list[int] = (255, 255, 255),
+) -> Image.Image:
+    """Convert an RGBA image to RGB with filled background color."""
+    assert image.mode == "RGBA"
+    converted = Image.new("RGB", image.size, background_color)
+    converted.paste(image, mask=image.split()[3])  # 3 is the alpha channel
+    return converted
 
-        # PIL image
-        if isinstance(data, Image.Image) or is_list_of(data, Image.Image):
-            image_processor = self._get_hf_image_processor(model_config)
 
-            if image_processor is None:
-                raise RuntimeError("No HuggingFace processor is available "
-                                   "to process the image object")
-            try:
-                batch_data = image_processor \
-                    .preprocess(data, return_tensors="pt") \
-                    .data
-            except Exception:
-                logger.error(
-                    "Failed to process image (%s) with the default mapper. "
-                    "This is most likely an edge-case with this model's image "
-                    "processor in transformers (type: %s), and not vLLM.",
-                    data,
-                    type(image_processor).__name__)
-                raise
+def _has_transparency(image: Image.Image) -> bool:
+    """Detect whether an image carries transparency data (RGBA, LA, PA,
+    or tRNS chunk in P/L/RGB PNGs)."""
+    if image.mode in ("RGBA", "LA", "PA"):
+        return True
+    return "transparency" in getattr(image, "info", {})
 
-            return MultiModalInputs(batch_data)
 
-        # Image embedding
-        elif isinstance(data, torch.Tensor) or is_list_of(data, torch.Tensor):
-            return MultiModalInputs({"image_embeds": data})
+def convert_image_mode(
+    image: Image.Image,
+    to_mode: str,
+    background_color: tuple[int, int, int] | list[int] = (255, 255, 255),
+) -> Image.Image:
+    if image.mode == to_mode:
+        return image
 
-        raise TypeError(f"Invalid image type: {type(data)}")
+    if to_mode == "RGB" and _has_transparency(image):
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+        return rgba_to_rgb(image, background_color)
 
-    def _default_max_multimodal_tokens(self, ctx: InputContext) -> int:
-        return 3000
+    return image.convert(to_mode)

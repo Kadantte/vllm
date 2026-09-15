@@ -1,14 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
-
-from vllm.utils import (create_kv_caches_with_random,
-                        create_kv_caches_with_random_flash)
+import torch
 
 
-@pytest.fixture()
-def kv_cache_factory():
-    return create_kv_caches_with_random
-
-
-@pytest.fixture()
-def kv_cache_factory_flashinfer():
-    return create_kv_caches_with_random_flash
+@pytest.fixture(autouse=True)
+def reset_default_torch_device():
+    """Several kernel tests call torch.set_default_device without restoring
+    it, which poisons subsequent tests in the same pytest run (e.g. CPU
+    tensors silently created on CUDA). Restore the factory default after
+    every test.
+    """
+    yield
+    torch.set_default_device(None)

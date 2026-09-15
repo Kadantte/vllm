@@ -1,103 +1,298 @@
-from typing import (AsyncGenerator, List, Mapping, Optional, Protocol,
-                    runtime_checkable)
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.config import DecodingConfig, ModelConfig
-from vllm.core.scheduler import SchedulerOutputs
-from vllm.inputs.data import PromptType
+from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator, Iterable, Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from vllm.config import ModelConfig, VllmConfig
+from vllm.distributed.weight_transfer.base import (
+    WeightTransferInitRequest,
+    WeightTransferUpdateRequest,
+)
+from vllm.inputs import EngineInput, PromptType
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.layers.sampler import SamplerOutput
-from vllm.outputs import EmbeddingRequestOutput, RequestOutput
+from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
-from vllm.prompt_adapter.request import PromptAdapterRequest
+from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.tasks import SupportedTask
+from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
+
+if TYPE_CHECKING:
+    from vllm.v1.engine import PauseMode
 
 
-@runtime_checkable
-class EngineClient(Protocol):
+@dataclass
+class StreamingInput:
+    """Input data for a streaming generation request.
+
+    This is used with generate() to support multi-turn streaming sessions
+    where inputs are provided via an async generator.
+    """
+
+    prompt: EngineInput
+    sampling_params: SamplingParams | None = None
+
+
+class EngineClient(ABC):
     """Protocol class for Clients to Engine"""
 
-    @property
-    def is_running(self) -> bool:
-        ...
+    vllm_config: VllmConfig
+    model_config: ModelConfig
+    renderer: BaseRenderer
+    input_processor: InputProcessor
 
     @property
-    def is_stopped(self) -> bool:
-        ...
+    @abstractmethod
+    def is_running(self) -> bool: ...
 
     @property
-    def errored(self) -> bool:
-        ...
+    @abstractmethod
+    def is_stopped(self) -> bool: ...
 
     @property
-    def dead_error(self) -> BaseException:
-        ...
+    @abstractmethod
+    def errored(self) -> bool: ...
 
+    @property
+    @abstractmethod
+    def dead_error(self) -> BaseException: ...
+
+    def check_admission(  # noqa: B027
+        self, n: int = 1, request_id: str | None = None
+    ) -> None:
+        """Reject the request up front if it would exceed queue limits.
+
+        Called before a response is started so that overload rejections can
+        carry an HTTP status, which is not possible once a streaming response
+        has begun. Engines without admission control accept everything.
+
+        Args:
+            n: Number of sequences the request will occupy.
+            request_id: Request id, used for logging only.
+
+        Raises:
+            GracefulHTTPError: If the request cannot be admitted.
+        """
+
+    @abstractmethod
     def generate(
         self,
-        prompt: PromptType,
+        prompt: EngineCoreRequest
+        | PromptType
+        | EngineInput
+        | AsyncGenerator[StreamingInput, None],
         sampling_params: SamplingParams,
         request_id: str,
-        lora_request: Optional[LoRARequest] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        *,
+        prompt_text: str | None = None,
+        lora_request: LoRARequest | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
+        data_parallel_rank: int | None = None,
+        session_id: str | None = None,
+        reasoning_ended: bool | None = None,
+        reasoning_parser_kwargs: dict[str, Any] | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request."""
         ...
 
+    @abstractmethod
     def encode(
         self,
-        prompt: PromptType,
+        prompt: PromptType | EngineInput,
         pooling_params: PoolingParams,
         request_id: str,
-        lora_request: Optional[LoRARequest] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
+        lora_request: LoRARequest | None = None,
+        trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
-    ) -> AsyncGenerator[EmbeddingRequestOutput, None]:
-        """Generate outputs for a request from an embedding model."""
+        tokenization_kwargs: dict[str, Any] | None = None,
+        reasoning_ended: bool | None = None,
+    ) -> AsyncGenerator[PoolingRequestOutput, None]:
+        """Generate outputs for a request from a pooling model."""
         ...
 
-    async def abort(self, request_id: str) -> None:
+    @abstractmethod
+    async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort a request.
 
         Args:
-            request_id: The unique id of the request.
+            request_id: The unique id of the request,
+                        or an iterable of such ids.
         """
-
-    async def get_model_config(self) -> ModelConfig:
-        """Get the model configuration of the vLLM engine."""
         ...
 
-    async def get_decoding_config(self) -> DecodingConfig:
-        ...
-        """Get the decoding configuration of the vLLM engine."""
-
-    async def get_tokenizer(
+    @abstractmethod
+    async def notify_kv_transfer_request_rejected(
         self,
-        lora_request: Optional[LoRARequest] = None,
-    ) -> AnyTokenizer:
-        """Get the appropriate tokenizer for the request"""
-        ...
-
-    async def is_tracing_enabled(self) -> bool:
-        ...
-
-    async def do_log_stats(
-        self,
-        scheduler_outputs: Optional[SchedulerOutputs] = None,
-        model_output: Optional[List[SamplerOutput]] = None,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        *,
+        data_parallel_rank: int | None = None,
     ) -> None:
+        """Notify the engine that a KV-transfer request was rejected before
+        engine admission, so connector-side cleanup can run (e.g. free
+        prefill blocks pinned on the P node).
+        """
         ...
 
+    @abstractmethod
+    async def is_tracing_enabled(self) -> bool: ...
+
+    @abstractmethod
+    async def do_log_stats(self) -> None: ...
+
+    @abstractmethod
     async def check_health(self) -> None:
         """Raise if unhealthy"""
         ...
 
+    @abstractmethod
     async def start_profile(self) -> None:
         """Start profiling the engine"""
         ...
 
+    @abstractmethod
     async def stop_profile(self) -> None:
-        """Start profiling the engine"""
+        """Stop profiling the engine"""
         ...
+
+    @abstractmethod
+    async def reset_mm_cache(self) -> None:
+        """Reset the multi-modal cache"""
+        ...
+
+    @abstractmethod
+    async def reset_encoder_cache(self) -> None:
+        """Reset the encoder cache"""
+        ...
+
+    @abstractmethod
+    async def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        """Reset the prefix cache and optionally any configured connector cache"""
+        ...
+
+    @abstractmethod
+    async def sleep(self, level: int = 1, mode: "PauseMode" = "abort") -> None:
+        """Sleep the engine"""
+        ...
+
+    @abstractmethod
+    async def wake_up(self, tags: list[str] | None = None) -> None:
+        """Wake up the engine"""
+        ...
+
+    @abstractmethod
+    async def is_sleeping(self) -> bool:
+        """Check whether the engine is sleeping"""
+        ...
+
+    @abstractmethod
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
+        """Load a new LoRA adapter into the engine for future requests."""
+        ...
+
+    @abstractmethod
+    async def pause_generation(
+        self,
+        *,
+        mode: "PauseMode" = "abort",
+        wait_for_inflight_requests: bool = False,
+        clear_cache: bool = True,
+    ) -> None:
+        """Pause new generation/encoding requests.
+
+        Args:
+            mode: How to handle in-flight requests:
+                - ``"abort"``: Abort all in-flight requests immediately
+                  and return partial results with "abort" reason (default).
+                - ``"wait"``: Wait for in-flight requests to complete.
+                - ``"keep"``: Freeze requests in queue; they resume on
+                  :meth:`resume_generation`.
+            wait_for_inflight_requests: DEPRECATED. Use ``mode="wait"`` instead.
+            clear_cache: DEPRECATED. Whether to clear KV and prefix caches
+                after draining.
+        """
+        ...
+
+    @abstractmethod
+    async def resume_generation(self) -> None:
+        """Resume accepting generation/encoding requests."""
+        ...
+
+    @abstractmethod
+    async def is_paused(self) -> bool:
+        """Return whether the engine is currently paused."""
+        ...
+
+    @abstractmethod
+    def shutdown(self, timeout: float | None = None) -> None:
+        """Shutdown the engine with optional timeout."""
+        ...
+
+    async def scale_elastic_ep(
+        self, new_data_parallel_size: int, drain_timeout: int = 300
+    ) -> None:
+        """Scale the engine"""
+        raise NotImplementedError
+
+    async def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+    ):
+        """Perform a collective RPC call to the given path."""
+        raise NotImplementedError
+
+    async def handle_fault(
+        self, fault_tolerance_request: FaultToleranceRequest
+    ) -> FaultToleranceResult:
+        """send fault tolerance instruction to the engine"""
+        raise NotImplementedError
+
+    async def get_status(self):
+        """Get fault tolerance status of all engines."""
+        raise NotImplementedError
+
+    async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        """Get supported tasks"""
+        raise NotImplementedError
+
+    async def init_weight_transfer_engine(
+        self, init_request: WeightTransferInitRequest
+    ) -> None:
+        """Initialize weight transfer for RL training."""
+        raise NotImplementedError
+
+    async def start_weight_update(self) -> None:
+        """Start a new weight update."""
+        raise NotImplementedError
+
+    async def start_draft_weight_update(self) -> None:
+        """Start a new weight update targeting the speculative draft model."""
+        raise NotImplementedError
+
+    async def update_weights(self, request: WeightTransferUpdateRequest) -> None:
+        """Batched weight update for RL training."""
+        raise NotImplementedError
+
+    async def finish_weight_update(self, weight_version: str | None = None) -> None:
+        """Finish the weight update and set its version if provided."""
+        raise NotImplementedError
+
+    async def update_weight_version(self, new_version: str) -> None:
+        """Set the weight version without updating weights."""
+        raise NotImplementedError
+
+    async def get_weight_version(self) -> str:
+        """Return the latest committed weight version."""
+        raise NotImplementedError
